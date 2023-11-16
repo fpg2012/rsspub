@@ -4,10 +4,11 @@ use std::path::PathBuf;
 use std::error::Error;
 use std::str::FromStr;
 use std::sync::Arc;
+use subprocess::Exec;
 
 use tokio::sync::Mutex;
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, Clone)]
 struct Site {
     name: String,
     url: String,
@@ -60,23 +61,20 @@ impl DailyEpub {
         Ok(channel)
     }
 
-    fn prepare_dir(&self, site: &Site) -> PathBuf {
+    fn prepare_dir(&self) -> PathBuf {
         let mut path = PathBuf::from_str(".").unwrap();
         path.push(self.date.to_string());
         // path.push(site.name.clone());
         fs::create_dir_all(&path).unwrap();
-
         path
     }
 
-    async fn generate_site(&self, site: &Site) -> Result<(), Box<dyn Error>> {
-        let path = self.prepare_dir(site);
+    async fn generate_site(site: Site, path: PathBuf, vis: Arc<Mutex<HashMap<String, HashSet<String>>>>) -> Result<(), Box<dyn Error>> {
+        
         let rss = Self::get_rss(site.url.clone()).await?;
         println!("{}: {}", &site.name, &rss.title);
 
         let mut new_guids: HashSet<String> = HashSet::new();
-
-        let vis = self.visited_guids.clone();
 
         let n = rss.items.len();
         let mut i = 1;
@@ -98,10 +96,10 @@ impl DailyEpub {
                 <!DOCTYPE html>
                 <head>
                     <meta charset=\"utf-8\">
-                    <title>{}-{}</title>
+                    <title>[{}]{}</title>
                 </head>
                 <body>
-                <h1>{}-{}</h1>
+                <h1>[{}]{}</h1>
                 {}
                 </body>
                 ", site.name, title, site.name, title, description};
@@ -129,11 +127,26 @@ impl DailyEpub {
         fs::write(&self.config.cache_file, vis).unwrap();
     }
 
-    async fn generate(&self) -> Result<(), Box<dyn Error>> {
+    async fn generate(&self) -> Result<PathBuf, Box<dyn Error>> {
+        let path = self.prepare_dir();
+        let vis = self.visited_guids.clone();
+
+        let mut join_set = tokio::task::JoinSet::new();
         for site in self.config.sites.iter() {
-            self.generate_site(site).await?;
+            let path = path.clone();
+            let site = site.clone();
+            let vis = vis.clone();
+            join_set.spawn(async move {
+                Self::generate_site(site, path, vis).await.unwrap();          
+            });
         }
-        Ok(())
+
+        // join
+        while let Some(result) = join_set.join_next().await {
+            continue;
+        }
+        
+        Ok(path)
     }
 }
 
@@ -142,7 +155,13 @@ async fn main() {
     println!("Hello, world!");
     let config = DailyEpubConfig::from_config_file(PathBuf::from_str("./config.toml").unwrap());
     let dayepub = DailyEpub::new(config);
-    dayepub.generate().await.unwrap();
+    let path = dayepub.generate().await.unwrap();
     println!("all done, write back visited guids");
+    let path_str = path.to_string_lossy();
+    let date = chrono::Local::now().date_naive();
+    let command = format!("pandoc -s -i {}/*.html -o {}.epub --toc --title \"DailyNews-{}\" --epub-cover-image ./cover.png", path_str, path_str, date.to_string());
+    println!("{}", command);
+    let pandoc_handle = Exec::cmd(command);
     dayepub.write_back_visited_guids().await;
+    pandoc_handle.join().unwrap();
 }
